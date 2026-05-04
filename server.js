@@ -4,7 +4,6 @@ const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 const cors = require('cors');
 const path = require('path');
-const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const { Pool } = require('pg');
@@ -22,12 +21,11 @@ cloudinary.config({
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Render слага app зад proxy → нужно е, за да работят secure cookie-та ──
 app.set('trust proxy', 1);
 
 // ── Database (PostgreSQL) ──
 if (!process.env.DATABASE_URL) {
-  console.warn('⚠ DATABASE_URL не е зададена. Сложи я в .env или Render env vars.');
+  console.warn('⚠ DATABASE_URL не е зададена.');
 }
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -52,9 +50,14 @@ async function initDb() {
       content TEXT NOT NULL,
       category TEXT NOT NULL,
       image TEXT,
+      images TEXT[],
       date TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
+  `);
+  // Добавяме images колона ако не съществува (за стари инсталации)
+  await pool.query(`
+    ALTER TABLE posts ADD COLUMN IF NOT EXISTS images TEXT[];
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS categories (
@@ -69,8 +72,6 @@ async function initDb() {
       value TEXT
     );
   `);
-
-  // Сесии се пазят в PostgreSQL (connect-pg-simple)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS "session" (
       "sid" varchar NOT NULL COLLATE "default",
@@ -81,17 +82,14 @@ async function initDb() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");`);
 
-  // Default admin
   const u = await pool.query('SELECT COUNT(*)::int AS c FROM users');
   if (u.rows[0].c === 0) {
     const hash = bcrypt.hashSync(process.env.ADMIN_PASS, 10);
     await pool.query('INSERT INTO users (username, password) VALUES ($1, $2)', [
       process.env.ADMIN_USER || 'admin', hash
     ]);
-    console.log('✦ Default admin created: admin / admin123');
   }
 
-  // Default categories
   const c = await pool.query('SELECT COUNT(*)::int AS c FROM categories');
   if (c.rows[0].c === 0) {
     const cats = ['Живот', 'Рецепти', 'Пътувания', 'Любими'];
@@ -103,7 +101,6 @@ async function initDb() {
     }
   }
 
-  // Default settings
   const defaultSettings = {
     blogName: 'Моят блог',
     tagline: 'Истории от живота',
@@ -140,14 +137,9 @@ const upload = multer({
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
-// ── CORS (кросс-домейн с credentials) ──
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-app.use(cors({
-  origin: FRONTEND_URL,
-  credentials: true
-}));
+app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 
-// ── Sessions (пазят се в PostgreSQL) ──
 const isProd = process.env.NODE_ENV === 'production';
 app.use(session({
   store: new PgSession({ pool, tableName: 'session' }),
@@ -162,13 +154,11 @@ app.use(session({
   }
 }));
 
-// ── Auth middleware ──
 function requireAuth(req, res, next) {
   if (req.session && req.session.userId) return next();
   res.status(401).json({ error: 'Unauthorized' });
 }
 
-// Малък helper за да пишем по-кратко
 const q = (text, params) => pool.query(text, params);
 
 // ── Auth routes ──
@@ -204,8 +194,7 @@ app.post('/api/change-credentials', requireAuth, async (req, res) => {
       await q('UPDATE users SET username = $1, password = $2 WHERE id = $3',
         [username, hash, req.session.userId]);
     } else {
-      await q('UPDATE users SET username = $1 WHERE id = $2',
-        [username, req.session.userId]);
+      await q('UPDATE users SET username = $1 WHERE id = $2', [username, req.session.userId]);
     }
     req.session.username = username;
     res.json({ ok: true });
@@ -219,8 +208,7 @@ app.get('/api/posts', async (req, res) => {
     const sql = category
       ? 'SELECT * FROM posts WHERE category = $1 ORDER BY created_at DESC'
       : 'SELECT * FROM posts ORDER BY created_at DESC';
-    const params = category ? [category] : [];
-    const { rows } = await q(sql, params);
+    const { rows } = await q(sql, category ? [category] : []);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -235,13 +223,16 @@ app.get('/api/posts/:id', async (req, res) => {
 
 app.post('/api/posts', requireAuth, async (req, res) => {
   try {
-    const { title, excerpt, content, category, image, date } = req.body;
+    const { title, excerpt, content, category, image, images, date } = req.body;
     if (!title || !content || !category)
       return res.status(400).json({ error: 'Заглавие, съдържание и категория са задължителни.' });
+    const imagesArr = Array.isArray(images) ? images : (images ? [images] : []);
+    const mainImage = image || (imagesArr.length > 0 ? imagesArr[0] : null);
     const { rows } = await q(
-      `INSERT INTO posts (title, excerpt, content, category, image, date)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [title, excerpt || '', content, category, image || null,
+      `INSERT INTO posts (title, excerpt, content, category, image, images, date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [title, excerpt || '', content, category, mainImage,
+       imagesArr.length > 0 ? imagesArr : null,
        date || new Date().toISOString().slice(0, 10)]
     );
     res.json(rows[0]);
@@ -250,13 +241,17 @@ app.post('/api/posts', requireAuth, async (req, res) => {
 
 app.put('/api/posts/:id', requireAuth, async (req, res) => {
   try {
-    const { title, excerpt, content, category, image, date } = req.body;
+    const { title, excerpt, content, category, image, images, date } = req.body;
     const exists = await q('SELECT id FROM posts WHERE id = $1', [req.params.id]);
     if (!exists.rows[0]) return res.status(404).json({ error: 'Статията не е намерена.' });
+    const imagesArr = Array.isArray(images) ? images : (images ? [images] : []);
+    const mainImage = image || (imagesArr.length > 0 ? imagesArr[0] : null);
     const { rows } = await q(
-      `UPDATE posts SET title=$1, excerpt=$2, content=$3, category=$4, image=$5, date=$6
-       WHERE id=$7 RETURNING *`,
-      [title, excerpt || '', content, category, image || null, date, req.params.id]
+      `UPDATE posts SET title=$1, excerpt=$2, content=$3, category=$4, image=$5, images=$6, date=$7
+       WHERE id=$8 RETURNING *`,
+      [title, excerpt || '', content, category, mainImage,
+       imagesArr.length > 0 ? imagesArr : null,
+       date, req.params.id]
     );
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -267,13 +262,17 @@ app.delete('/api/posts/:id', requireAuth, async (req, res) => {
     const { rows } = await q('SELECT * FROM posts WHERE id = $1', [req.params.id]);
     const post = rows[0];
     if (!post) return res.status(404).json({ error: 'Статията не е намерена.' });
-    if (post.image && post.image.includes('cloudinary.com')) {
-      try {
-        const parts = post.image.split('/');
-        const filenameWithExt = parts[parts.length - 1];
-        const publicId = `blog-irina/${filenameWithExt.split('.')[0]}`;
-        await cloudinary.uploader.destroy(publicId);
-      } catch (_) {}
+    // Изтрий всички снимки от Cloudinary
+    const allImages = post.images || (post.image ? [post.image] : []);
+    for (const imgUrl of allImages) {
+      if (imgUrl && imgUrl.includes('cloudinary.com')) {
+        try {
+          const parts = imgUrl.split('/');
+          const filenameWithExt = parts[parts.length - 1];
+          const publicId = `blog-irina/${filenameWithExt.split('.')[0]}`;
+          await cloudinary.uploader.destroy(publicId);
+        } catch (_) {}
+      }
     }
     await q('DELETE FROM posts WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
@@ -339,10 +338,10 @@ app.put('/api/settings', requireAuth, async (req, res) => {
 // ── Upload route ──
 app.post('/api/upload', requireAuth, upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Няма файл.' });
-  res.json({ url: req.file.path }); // Cloudinary връща пълен https:// URL
+  res.json({ url: req.file.path });
 });
 
-// Health check (полезен за Render)
+// Health check
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // ── Start ──
