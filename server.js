@@ -9,6 +9,16 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const { Pool } = require('pg');
 
+// ── Cloudinary ──
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -108,20 +118,16 @@ async function initDb() {
   }
 }
 
-// ── Upload dir (Render Persistent Disk) ──
-// На Render монтирай persistent disk на /var/data → задай UPLOAD_DIR=/var/data/uploads
-const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'public', 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `img_${Date.now()}${ext}`);
-  }
+// ── Upload (Cloudinary) ──
+const cloudinaryStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'blog-irina',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif'],
+  },
 });
 const upload = multer({
-  storage,
+  storage: cloudinaryStorage,
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['.jpg', '.jpeg', '.png', '.webp', '.gif'];
@@ -140,9 +146,6 @@ app.use(cors({
   origin: FRONTEND_URL,
   credentials: true
 }));
-
-// Сервиране на качените снимки от persistent disk
-app.use('/uploads', express.static(uploadDir));
 
 // ── Sessions (пазят се в PostgreSQL) ──
 const isProd = process.env.NODE_ENV === 'production';
@@ -264,10 +267,12 @@ app.delete('/api/posts/:id', requireAuth, async (req, res) => {
     const { rows } = await q('SELECT * FROM posts WHERE id = $1', [req.params.id]);
     const post = rows[0];
     if (!post) return res.status(404).json({ error: 'Статията не е намерена.' });
-    if (post.image && post.image.startsWith('/uploads/')) {
+    if (post.image && post.image.includes('cloudinary.com')) {
       try {
-        const filename = post.image.replace('/uploads/', '');
-        fs.unlinkSync(path.join(uploadDir, filename));
+        const parts = post.image.split('/');
+        const filenameWithExt = parts[parts.length - 1];
+        const publicId = `blog-irina/${filenameWithExt.split('.')[0]}`;
+        await cloudinary.uploader.destroy(publicId);
       } catch (_) {}
     }
     await q('DELETE FROM posts WHERE id = $1', [req.params.id]);
@@ -320,7 +325,7 @@ app.put('/api/settings', requireAuth, async (req, res) => {
     const allowed = ['blogName', 'tagline', 'author', 'description'];
     for (const key of allowed) {
       if (req.body[key] !== undefined) {
-        await q(
+        await pool.query(
           `INSERT INTO settings (key, value) VALUES ($1, $2)
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
           [key, req.body[key]]
@@ -332,10 +337,9 @@ app.put('/api/settings', requireAuth, async (req, res) => {
 });
 
 // ── Upload route ──
-// Връщаме относителен път /uploads/xxx.jpg (фронтендът знае как да си го построи)
 app.post('/api/upload', requireAuth, upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Няма файл.' });
-  res.json({ url: `/uploads/${req.file.filename}` });
+  res.json({ url: req.file.path }); // Cloudinary връща пълен https:// URL
 });
 
 // Health check (полезен за Render)
@@ -347,7 +351,6 @@ initDb()
     app.listen(PORT, () => {
       console.log(`\n✦ Blog API running at http://localhost:${PORT}`);
       console.log(`  CORS allowed origin: ${FRONTEND_URL}`);
-      console.log(`  Upload dir: ${uploadDir}`);
     });
   })
   .catch(err => {
