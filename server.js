@@ -1,10 +1,9 @@
 require('dotenv').config();
 const express = require('express');
-const session = require('express-session');
-const PgSession = require('connect-pg-simple')(session);
 const cors = require('cors');
 const path = require('path');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const { Pool } = require('pg');
 
@@ -20,8 +19,7 @@ cloudinary.config({
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-app.set('trust proxy', 1);
+const JWT_SECRET = process.env.JWT_SECRET || 'blog-jwt-secret-change-this';
 
 if (!process.env.DATABASE_URL) {
   console.warn('⚠ DATABASE_URL не е зададена.');
@@ -78,19 +76,10 @@ async function initDb() {
       value TEXT
     );
   `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS "session" (
-      "sid" varchar NOT NULL COLLATE "default",
-      "sess" json NOT NULL,
-      "expire" timestamp(6) NOT NULL,
-      CONSTRAINT "session_pkey" PRIMARY KEY ("sid") NOT DEFERRABLE INITIALLY IMMEDIATE
-    );
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");`);
 
   const u = await pool.query('SELECT COUNT(*)::int AS c FROM users');
   if (u.rows[0].c === 0) {
-    const hash = bcrypt.hashSync(process.env.ADMIN_PASS, 10);
+    const hash = bcrypt.hashSync(process.env.ADMIN_PASS || 'admin123', 10);
     await pool.query('INSERT INTO users (username, password) VALUES ($1, $2)', [
       process.env.ADMIN_USER || 'admin', hash
     ]);
@@ -138,28 +127,45 @@ app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-app.use(cors({ origin: FRONTEND_URL, credentials: true }));
-
-const isProd = process.env.NODE_ENV === 'production';
-app.use(session({
-  store: new PgSession({ pool, tableName: 'session' }),
-  secret: process.env.SESSION_SECRET || 'my-super-secret-blog-key-change-this',
-  resave: false, saveUninitialized: false,
-  cookie: { maxAge: 7*24*60*60*1000, httpOnly: true, sameSite: isProd ? 'none' : 'lax', secure: isProd }
+app.use(cors({
+  origin: FRONTEND_URL,
+  credentials: false  // JWT не се нуждае от credentials
 }));
 
+// ── JWT Auth middleware ──
 function requireAuth(req, res, next) {
-  if (req.session && req.session.userId) return next();
-  res.status(401).json({ error: 'Unauthorized' });
+  const authHeader = req.headers['authorization']
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  const token = authHeader.split(' ')[1]
+  try {
+    const payload = jwt.verify(token, JWT_SECRET)
+    req.userId = payload.userId
+    req.username = payload.username
+    next()
+  } catch {
+    res.status(401).json({ error: 'Невалиден или изтекъл токен.' })
+  }
 }
 
 const q = (text, params) => pool.query(text, params);
 
-// ── Auth ──
+// ── Auth routes ──
 app.get('/api/me', (req, res) => {
-  if (req.session.userId) res.json({ loggedIn: true, username: req.session.username });
-  else res.json({ loggedIn: false });
+  const authHeader = req.headers['authorization']
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.json({ loggedIn: false })
+  }
+  const token = authHeader.split(' ')[1]
+  try {
+    const payload = jwt.verify(token, JWT_SECRET)
+    res.json({ loggedIn: true, username: payload.username })
+  } catch {
+    res.json({ loggedIn: false })
+  }
 });
+
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -168,24 +174,33 @@ app.post('/api/login', async (req, res) => {
     const user = rows[0];
     if (!user || !bcrypt.compareSync(password, user.password))
       return res.status(401).json({ error: 'Грешно потребителско име или парола.' });
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    res.json({ ok: true, username: user.username });
+    const token = jwt.sign(
+      { userId: user.id, username: user.username },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    )
+    res.json({ ok: true, username: user.username, token });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post('/api/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
+
+app.post('/api/logout', (req, res) => {
+  // JWT logout е само на клиента (изтриване на токена)
+  res.json({ ok: true });
+});
+
 app.post('/api/change-credentials', requireAuth, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username) return res.status(400).json({ error: 'Потребителското име е задължително.' });
     if (password) {
       const hash = bcrypt.hashSync(password, 10);
-      await q('UPDATE users SET username=$1, password=$2 WHERE id=$3', [username, hash, req.session.userId]);
+      await q('UPDATE users SET username=$1, password=$2 WHERE id=$3', [username, hash, req.userId]);
     } else {
-      await q('UPDATE users SET username=$1 WHERE id=$2', [username, req.session.userId]);
+      await q('UPDATE users SET username=$1 WHERE id=$2', [username, req.userId]);
     }
-    req.session.username = username;
-    res.json({ ok: true });
+    // Върни нов токен с обновено username
+    const token = jwt.sign({ userId: req.userId, username }, JWT_SECRET, { expiresIn: '7d' })
+    res.json({ ok: true, token });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -254,8 +269,6 @@ app.delete('/api/posts/:id', requireAuth, async (req, res) => {
 });
 
 // ── Comments ──
-
-// Публично: одобрени коментари за статия
 app.get('/api/posts/:id/comments', async (req, res) => {
   try {
     const { rows } = await q(
@@ -265,44 +278,32 @@ app.get('/api/posts/:id/comments', async (req, res) => {
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Публично: изпрати коментар (чака одобрение)
 app.post('/api/posts/:id/comments', async (req, res) => {
   try {
     const { name, content } = req.body;
-    if (!name || !content) return res.status(400).json({ error: 'Попълни име и коментар.' });
+    if (!name || !content) return res.status(400).json({ error: 'Попълни ime и коментар.' });
     if (content.length > 1000) return res.status(400).json({ error: 'Коментарът е твърде дълъг.' });
-    await q(
-      'INSERT INTO comments (post_id, name, content) VALUES ($1, $2, $3)',
-      [req.params.id, name.trim(), content.trim()]
-    );
+    await q('INSERT INTO comments (post_id, name, content) VALUES ($1, $2, $3)', [req.params.id, name.trim(), content.trim()]);
     res.json({ ok: true, message: 'Коментарът ти е изпратен за одобрение.' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Админ: всички коментари
 app.get('/api/admin/comments', requireAuth, async (req, res) => {
   try {
     const { rows } = await q(`
       SELECT c.id, c.name, c.content, c.approved, c.created_at,
              p.title AS post_title, p.id AS post_id
-      FROM comments c
-      JOIN posts p ON p.id = c.post_id
+      FROM comments c JOIN posts p ON p.id = c.post_id
       ORDER BY c.approved ASC, c.created_at DESC
     `);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Админ: одобри
 app.put('/api/admin/comments/:id/approve', requireAuth, async (req, res) => {
   try {
     await q('UPDATE comments SET approved=TRUE WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Админ: изтрий
 app.delete('/api/admin/comments/:id', requireAuth, async (req, res) => {
   try {
     await q('DELETE FROM comments WHERE id=$1', [req.params.id]);
